@@ -17,17 +17,13 @@
 /* ================= FATFS (SD) ================= */
 #include "sd_spi.h"
 #include "ff.h"
-
+void decode_log_message(void);
 /* ================= GLOBAL ================= */
 uint32_t g_sysClock;
 
 #define EEPROM_ADDR 0x50
 
 uint8_t eeprom_page[64];
-
-volatile bool log_eeprom_write_flag = false;
-/* Store raw CAN payload to write into EEPROM */
-uint8_t log_frame_copy[8];
 uint16_t eeprom_log_addr = 0x0100;   // start address for log storage
 
 bool finish_flag = 0;
@@ -37,7 +33,61 @@ bool USB_BUTTON = 0;
 #define BTN_SD     GPIO_PIN_0   // PD0 → EEPROM → SD
 #define BTN_USB    GPIO_PIN_1   // PD1 → EEPROM → USB
 
+//============ Date and Time conversion ============
+#define GPS_EPOCH_YEAR 1980
+#define GPS_EPOCH_DAY_OFFSET 5U
+#define SECONDS_PER_DAY 86400UL
 
+static const uint8_t days_in_month[12] =
+{
+    31,28,31,30,31,30,31,31,30,31,30,31
+};
+
+static inline uint8_t is_leap_year(uint16_t year)
+{
+    return ((year % 4U == 0U && year % 100U != 0U) ||
+            (year % 400U == 0U));
+}
+
+static void seconds_to_calendar(uint32_t seconds,
+                                uint16_t *year,
+                                uint8_t *month,
+                                uint8_t *day,
+                                uint8_t *hour,
+                                uint8_t *min,
+                                uint8_t *sec)
+{
+    uint32_t days;
+    uint16_t y;
+    uint8_t m;
+
+    seconds += (GPS_EPOCH_DAY_OFFSET * SECONDS_PER_DAY);
+
+    *sec = seconds % 60U;
+    seconds /= 60U;
+    *min = seconds % 60U;
+    seconds /= 60U;
+    *hour = seconds % 24U;
+    days = seconds / 24U;
+
+    for (y = GPS_EPOCH_YEAR;; y++)
+    {
+        uint16_t year_days = is_leap_year(y) ? 366U : 365U;
+        if (days < year_days) break;
+        days -= year_days;
+    }
+    *year = y;
+
+    for (m = 1; m <= 12; m++)
+    {
+        uint8_t dim = days_in_month[m - 1];
+        if (m == 2 && is_leap_year(*year)) dim++;
+        if (days < dim) break;
+        days -= dim;
+    }
+    *month = m;
+    *day = (uint8_t)(days + 1U);
+}
 /* ================= FATFS OBJECTS ================= */
 FATFS fs;
 FIL file;
@@ -60,11 +110,25 @@ void delay_ms(uint32_t ms)
 static uint8_t sRXBufLog[8];
 static tCANMsgObject sRXMsgObjLog;
 
-volatile uint16_t log_data1 = 0;
-volatile uint16_t log_data2 = 0;
-volatile uint16_t log_data4 = 0;
-volatile uint16_t log_data5 = 0;
+//volatile uint16_t log_data1 = 0;
+//volatile uint16_t log_data2 = 0;
+//volatile uint16_t log_data4 = 0;
+//volatile uint16_t log_data5 = 0;
 volatile bool log_update_flag = false;
+
+volatile uint32_t cpu_time_sec = 0;
+volatile uint32_t loco_id = 0;
+volatile uint16_t speed = 0;
+volatile uint32_t abs_loc = 0;
+volatile uint8_t direction = 0;
+volatile uint32_t last_rfid = 0;
+volatile uint16_t tin = 0;
+volatile uint8_t brake_type = 0;
+volatile uint8_t system_fail = 0;
+
+volatile uint8_t log_frame_buf[3][8];
+volatile uint8_t log_frames_received = 0;
+volatile bool log_message_ready = false;
 
 void Buttons_Init(void)
 {
@@ -90,35 +154,60 @@ void CAN1IntHandler(void)
         /* Clear controller status interrupt */
         (void)CANStatusGet(CAN1_BASE, CAN_STS_CONTROL);
     }
-    else if (cause == 1)   /* Message Object 1 = LOG RX */
+//    else if (cause == 1)   /* Message Object 1 = LOG RX */
+//    {
+//        CANMessageGet(CAN1_BASE, 1, &sRXMsgObjLog, true);
+//
+//        if (sRXBufLog[0] == LOG_MSG_TYPE1 &&
+//            sRXBufLog[1] == LOG_MSG_TYPE2)
+//        {
+//            /* Copy raw frame for EEPROM logging */
+//            for (int i = 0; i < 8; i++)
+//                log_frame_copy[i] = sRXBufLog[i];
+//
+//            /* Build 48-bit packed payload */
+//            uint64_t packed = 0;
+//
+//            packed |= ((uint64_t)sRXBufLog[2] << 40);
+//            packed |= ((uint64_t)sRXBufLog[3] << 32);
+//            packed |= ((uint64_t)sRXBufLog[4] << 24);
+//            packed |= ((uint64_t)sRXBufLog[5] << 16);
+//            packed |= ((uint64_t)sRXBufLog[6] << 8);
+//            packed |= ((uint64_t)sRXBufLog[7]);
+//
+//            /* Extract fields */
+//            log_data1 = (packed >> 34) & 0x3FFF;   /* 14 bits */
+//            log_data2 = (packed >> 24) & 0x03FF;   /* 10 bits */
+//            log_data4 = (packed >> 13) & 0x07FF;   /* 11 bits */
+//            log_data5 = (packed)       & 0x1FFF;   /* 13 bits */
+//
+//            log_update_flag = true;
+//            log_eeprom_write_flag = true;
+//        }
+//
+//        CANIntClear(CAN1_BASE, 1);
+//    }
+    else if (cause == 1)
     {
         CANMessageGet(CAN1_BASE, 1, &sRXMsgObjLog, true);
 
-        if (sRXBufLog[0] == LOG_MSG_TYPE1 &&
-            sRXBufLog[1] == LOG_MSG_TYPE2)
+        if (sRXBufLog[0] == LOG_MSG_TYPE1)
         {
-            /* Copy raw frame for EEPROM logging */
-            for (int i = 0; i < 8; i++)
-                log_frame_copy[i] = sRXBufLog[i];
+            uint8_t seq_index = (sRXBufLog[1] >> 2) & 0x3F;
 
-            /* Build 48-bit packed payload */
-            uint64_t packed = 0;
+            if (seq_index < 3)
+            {
+                for (int i = 0; i < 8; i++)
+                    log_frame_buf[seq_index][i] = sRXBufLog[i];
 
-            packed |= ((uint64_t)sRXBufLog[2] << 40);
-            packed |= ((uint64_t)sRXBufLog[3] << 32);
-            packed |= ((uint64_t)sRXBufLog[4] << 24);
-            packed |= ((uint64_t)sRXBufLog[5] << 16);
-            packed |= ((uint64_t)sRXBufLog[6] << 8);
-            packed |= ((uint64_t)sRXBufLog[7]);
+                log_frames_received++;
 
-            /* Extract fields */
-            log_data1 = (packed >> 34) & 0x3FFF;   /* 14 bits */
-            log_data2 = (packed >> 24) & 0x03FF;   /* 10 bits */
-            log_data4 = (packed >> 13) & 0x07FF;   /* 11 bits */
-            log_data5 = (packed)       & 0x1FFF;   /* 13 bits */
-
-            log_update_flag = true;
-            log_eeprom_write_flag = true;
+                if (log_frames_received >= 3)
+                {
+                    log_frames_received = 0;
+                    log_message_ready = true;
+                }
+            }
         }
 
         CANIntClear(CAN1_BASE, 1);
@@ -468,7 +557,7 @@ uint8_t EEPROM_ReadByte(uint16_t memAddr)
     return data;
 }
 
-void EEPROM_WritePage(uint16_t memAddr, uint8_t *data, uint8_t len)
+void EEPROM_WritePage(uint16_t memAddr, volatile uint8_t *data, uint8_t len)
 {
     uint8_t i;
 
@@ -496,7 +585,7 @@ void EEPROM_WritePage(uint16_t memAddr, uint8_t *data, uint8_t len)
         while(I2CMasterBusy(I2C0_BASE));
     }
 }
-void EEPROM_ReadPage(uint16_t pageStartAddr, uint8_t *buffer, uint8_t len)
+void EEPROM_ReadPage(uint16_t pageStartAddr, volatile uint8_t *buffer, uint8_t len)
 {
     uint8_t i;
 
@@ -561,6 +650,55 @@ static int u16_to_dec(char *out, uint16_t val)
 
     return j;
 }
+static int u32_to_dec(char *out, uint32_t v)
+{
+    char buf[10];
+    int i = 0, j = 0;
+
+    if (v == 0) { out[0] = '0'; return 1; }
+
+    while (v > 0)
+    {
+        buf[i++] = (v % 10) + '0';
+        v /= 10;
+    }
+    while (i) out[j++] = buf[--i];
+    return j;
+}
+static int build_csv_line(char *line)
+{
+    uint16_t year;
+    uint8_t month, day, hour, min, sec;
+
+    seconds_to_calendar(cpu_time_sec,
+                        &year, &month, &day,
+                        &hour, &min, &sec);
+
+    int idx = 0;
+
+    idx += u32_to_dec(&line[idx], day);   line[idx++] = '/';
+    idx += u32_to_dec(&line[idx], month); line[idx++] = '/';
+    idx += u32_to_dec(&line[idx], year);  line[idx++] = ',';
+
+    idx += u32_to_dec(&line[idx], hour);  line[idx++] = ':';
+    idx += u32_to_dec(&line[idx], min);   line[idx++] = ':';
+    idx += u32_to_dec(&line[idx], sec);   line[idx++] = ',';
+
+    idx += u32_to_dec(&line[idx], loco_id);   line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], speed);     line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], abs_loc);   line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], direction); line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], last_rfid); line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], tin);       line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], brake_type);line[idx++] = ',';
+    idx += u32_to_dec(&line[idx], system_fail);
+
+    line[idx++] = '\r';
+    line[idx++] = '\n';
+    line[idx] = 0;
+
+    return idx;
+}
 static void decode_log_frame(uint8_t *b,
                              uint16_t *d1,
                              uint16_t *d2,
@@ -596,53 +734,50 @@ void EEPROM_to_SD(void)
 
     while (addr < eeprom_log_addr)
     {
-        EEPROM_ReadPage(addr, eeprom_page, 8);   // read one CAN frame
+        /* Read 3 frames (1 complete log message = 24 bytes) */
+        EEPROM_ReadPage(addr,     log_frame_buf[0], 8);
+        EEPROM_ReadPage(addr + 8, log_frame_buf[1], 8);
+        EEPROM_ReadPage(addr +16, log_frame_buf[2], 8);
 
-        uint16_t d1, d2, d4, d5;
-        decode_log_frame(eeprom_page, &d1, &d2, &d4, &d5);
+        decode_log_message();
 
-        char line[48];
+        /* Convert seconds → calendar */
+        uint16_t year;
+        uint8_t month, day, hour, min, sec;
+
+        seconds_to_calendar(cpu_time_sec,
+                            &year, &month, &day,
+                            &hour, &min, &sec);
+
+        char line[96];
         int idx = 0;
 
-        /* D1= */
-        line[idx++] = 'D';
-        line[idx++] = '1';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d1);
+        /* Date DD/MM/YYYY */
+        idx += u32_to_dec(&line[idx], day);   line[idx++] = '/';
+        idx += u32_to_dec(&line[idx], month); line[idx++] = '/';
+        idx += u32_to_dec(&line[idx], year);  line[idx++] = ',';
 
-        /* space */
-        line[idx++] = ' ';
+        /* Time HH:MM:SS */
+        idx += u32_to_dec(&line[idx], hour);  line[idx++] = ':';
+        idx += u32_to_dec(&line[idx], min);   line[idx++] = ':';
+        idx += u32_to_dec(&line[idx], sec);   line[idx++] = ',';
 
-        /* D2= */
-        line[idx++] = 'D';
-        line[idx++] = '2';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d2);
-
-        /* space */
-        line[idx++] = ' ';
-
-        /* D4= */
-        line[idx++] = 'D';
-        line[idx++] = '4';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d4);
-
-        /* space */
-        line[idx++] = ' ';
-
-        /* D5= */
-        line[idx++] = 'D';
-        line[idx++] = '5';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d5);
+        /* CSV Fields */
+        idx += u32_to_dec(&line[idx], loco_id);    line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], speed);      line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], abs_loc);    line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], direction);  line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], last_rfid);  line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], tin);        line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], brake_type); line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], system_fail);
 
         line[idx++] = '\r';
         line[idx++] = '\n';
 
         f_write(&file, line, idx, &bw);
 
-        addr += 8;
+        addr += 24;   // move to next complete log message
     }
 
     f_sync(&file);
@@ -671,54 +806,108 @@ void EEPROM_to_USB(void)
 
     while (addr < eeprom_log_addr)
     {
-        EEPROM_ReadPage(addr, eeprom_page, 8);
+        /* Read 3 frames (1 complete log message) */
+        EEPROM_ReadPage(addr,     log_frame_buf[0], 8);
+        EEPROM_ReadPage(addr + 8, log_frame_buf[1], 8);
+        EEPROM_ReadPage(addr +16, log_frame_buf[2], 8);
 
-        uint16_t d1, d2, d4, d5;
-        decode_log_frame(eeprom_page, &d1, &d2, &d4, &d5);
+        decode_log_message();
 
-        char line[48];
+        uint16_t year;
+        uint8_t month, day, hour, min, sec;
+
+        seconds_to_calendar(cpu_time_sec,
+                            &year, &month, &day,
+                            &hour, &min, &sec);
+
+        char line[96];
         int idx = 0;
 
-        line[idx++] = 'D';
-        line[idx++] = '1';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d1);
+        idx += u32_to_dec(&line[idx], day);   line[idx++] = '/';
+        idx += u32_to_dec(&line[idx], month); line[idx++] = '/';
+        idx += u32_to_dec(&line[idx], year);  line[idx++] = ',';
 
-        line[idx++] = ' ';
-        line[idx++] = 'D';
-        line[idx++] = '2';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d2);
+        idx += u32_to_dec(&line[idx], hour);  line[idx++] = ':';
+        idx += u32_to_dec(&line[idx], min);   line[idx++] = ':';
+        idx += u32_to_dec(&line[idx], sec);   line[idx++] = ',';
 
-        line[idx++] = ' ';
-        line[idx++] = 'D';
-        line[idx++] = '4';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d4);
-
-        line[idx++] = ' ';
-        line[idx++] = 'D';
-        line[idx++] = '5';
-        line[idx++] = '=';
-        idx += u16_to_dec(&line[idx], d5);
+        idx += u32_to_dec(&line[idx], loco_id);    line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], speed);      line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], abs_loc);    line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], direction);  line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], last_rfid);  line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], tin);        line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], brake_type); line[idx++] = ',';
+        idx += u32_to_dec(&line[idx], system_fail);
 
         line[idx++] = '\r';
         line[idx++] = '\n';
-
-        line[idx] = '\0';
+        line[idx] = 0;
 
         CH376_Write(line);
 
-        addr += 8;
+        addr += 24;
     }
 
     CH376_Close();
 }
-
 /////////////////////////////////////////////////////
 //////////////////// MAIN ///////////////////////////
 /////////////////////////////////////////////////////
+void decode_log_message(void)
+{
+    uint8_t *f0 = (uint8_t*)log_frame_buf[0];
+    uint8_t *f1 = (uint8_t*)log_frame_buf[1];
+    uint8_t *f2 = (uint8_t*)log_frame_buf[2];
 
+    /* -------- CPU_TIME_SEC -------- */
+    cpu_time_sec =
+        ((uint32_t)f0[2] << 24) |
+        ((uint32_t)f0[3] << 16) |
+        ((uint32_t)f0[4] << 8)  |
+        ((uint32_t)f0[5]);
+
+    /* -------- LocoID (20 bits) -------- */
+    loco_id =
+        ((uint32_t)f0[6] << 12) |
+        ((uint32_t)(f0[7] >> 4) << 8) |
+        ((uint32_t)(f0[7] & 0x0F) << 4) |
+        ((uint32_t)(f1[2] >> 4));
+
+    /* -------- Speed (9 bits) -------- */
+    speed =
+        ((uint16_t)(f1[2] & 0x0F) << 5) |
+        ((uint16_t)(f1[3] >> 3));
+
+    /* -------- Absolute Location (23 bits) -------- */
+    abs_loc =
+        ((uint32_t)(f1[3] & 0x07) << 20) |
+        ((uint32_t)f1[4] << 12) |
+        ((uint32_t)f1[5] << 4) |
+        ((uint32_t)(f1[6] >> 4));
+
+    /* -------- Direction -------- */
+    direction = (f1[6] >> 6) & 0x01;
+
+    /* -------- Last RFID (23 bits) -------- */
+    last_rfid =
+        ((uint32_t)(f1[6] & 0x3F) << 17) |
+        ((uint32_t)f1[7] << 9) |
+        ((uint32_t)(f2[2] >> 1));
+
+    /* -------- TIN (9 bits) -------- */
+    tin =
+        ((uint16_t)(f2[3] & 0x7F) << 2) |
+        ((uint16_t)(f2[4] >> 6));
+
+    /* -------- Brake Type -------- */
+    brake_type = (f2[4] >> 3) & 0x07;
+
+    /* -------- System Failure -------- */
+    system_fail =
+        ((f2[4] & 0x07) << 5) |
+        ((f2[5]) & 0x1F);
+}
 int main(void)
 {
     finish_flag = 0;
@@ -817,23 +1006,25 @@ int main(void)
                 while((GPIOPinRead(BTN_PORT, BTN_USB) & BTN_USB) == 0);
             }
         }
-        if (log_eeprom_write_flag)
+        if (log_message_ready)
         {
-            log_eeprom_write_flag = false;
+            log_message_ready = false;
 
-            /* Write 8-byte CAN frame to EEPROM */
-
-            EEPROM_WritePage(eeprom_log_addr, log_frame_copy, 8);
-
-            /* Wait EEPROM write cycle (5–6 ms typical) */
+            /* Write full 3-frame message (24 bytes) */
+            EEPROM_WritePage(eeprom_log_addr,     log_frame_buf[0], 8);
+            delay_ms(6);
+            EEPROM_WritePage(eeprom_log_addr + 8, log_frame_buf[1], 8);
+            delay_ms(6);
+            EEPROM_WritePage(eeprom_log_addr +16, log_frame_buf[2], 8);
             delay_ms(6);
 
-            /* Move to next log slot */
-            eeprom_log_addr += 8;
+            eeprom_log_addr += 24;
 
-            /* Optional: prevent overflow */
-            if (eeprom_log_addr >= 0x7FFF)
+            if (eeprom_log_addr >= 0x7F00)
                 eeprom_log_addr = 0x0100;
+
+            /* Also decode for live variables */
+            decode_log_message();
         }
     }
 
