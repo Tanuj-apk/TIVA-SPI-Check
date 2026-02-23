@@ -624,32 +624,6 @@ void EEPROM_Read_Data(){
     EEPROM_ReadByte(0x000A); delay_ms(6);
 }
 
-static uint8_t hex_char(uint8_t v)
-{
-    return (v < 10) ? ('0' + v) : ('A' + v - 10);
-}
-static int u16_to_dec(char *out, uint16_t val)
-{
-    char buf[6];   // max 65535 → 5 digits
-    int i = 0, j = 0;
-
-    if (val == 0)
-    {
-        out[0] = '0';
-        return 1;
-    }
-
-    while (val > 0)
-    {
-        buf[i++] = (val % 10) + '0';
-        val /= 10;
-    }
-
-    while (i > 0)
-        out[j++] = buf[--i];
-
-    return j;
-}
 static int u32_to_dec(char *out, uint32_t v)
 {
     char buf[10];
@@ -699,26 +673,7 @@ static int build_csv_line(char *line)
 
     return idx;
 }
-static void decode_log_frame(uint8_t *b,
-                             uint16_t *d1,
-                             uint16_t *d2,
-                             uint16_t *d4,
-                             uint16_t *d5)
-{
-    uint64_t packed = 0;
 
-    packed |= ((uint64_t)b[2] << 40);
-    packed |= ((uint64_t)b[3] << 32);
-    packed |= ((uint64_t)b[4] << 24);
-    packed |= ((uint64_t)b[5] << 16);
-    packed |= ((uint64_t)b[6] << 8);
-    packed |= ((uint64_t)b[7]);
-
-    *d1 = (packed >> 34) & 0x3FFF;
-    *d2 = (packed >> 24) & 0x03FF;
-    *d4 = (packed >> 13) & 0x07FF;
-    *d5 = (packed)       & 0x1FFF;
-}
 void EEPROM_to_SD(void)
 {
     uint16_t total_bytes = (eeprom_log_addr - 0x0100) & ~0x07;
